@@ -1,0 +1,193 @@
+"""
+Step 7v3 — Submission using V3 (or V2 fallback) + Dynamic Temporal Windows
+
+Tries models/test_preds_v3.npy first; falls back to V2 if V3 does not exist.
+The dynamic temporal-window logic is identical to step7v2.
+
+Inputs:
+  models/test_preds_v3.npy  (preferred) OR  models/test_preds_v2.npy  (fallback)
+  models/best_threshold_v3.txt           OR  models/best_threshold.txt
+  models/test_ids_order.parquet
+  data/archive/transactions/batch-{1-4}/*.parquet
+
+Outputs: submission.csv
+"""
+import polars as pl
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datetime import timedelta
+
+ROOT   = Path(r"C:\Users\ujjaw\Downloads\AML_Mule_Project")
+DATA   = ROOT / "data" / "archive"
+MODELS = ROOT / "models"
+
+# ── Load predictions (v3 → v2 fallback) ────────────────────────────
+v3_pred_path = MODELS / "test_preds_v3.npy"
+v3_thr_path  = MODELS / "best_threshold_v3.txt"
+
+if v3_pred_path.exists() and v3_thr_path.exists():
+    preds_path = v3_pred_path
+    thr_path   = v3_thr_path
+    pred_label = "V3"
+else:
+    preds_path = MODELS / "test_preds_v2.npy"
+    thr_path   = MODELS / "best_threshold.txt"
+    pred_label = "V2 (fallback)"
+
+test_ids_order = pl.read_parquet(MODELS / "test_ids_order.parquet")
+preds          = np.load(preds_path)
+test_accounts  = test_ids_order.with_columns(pl.Series("pred", preds))
+
+with open(thr_path) as f:
+    threshold = float(f.read().strip())
+
+print(f"Using predictions: {pred_label}")
+print(f"Test accounts:     {test_accounts.shape[0]}")
+print(f"Threshold:         {threshold:.4f}")
+print(f"Pred stats: mean={preds.mean():.4f}  min={preds.min():.4f}  max={preds.max():.4f}")
+assert test_accounts.shape[0] == len(preds)
+
+# ── Identify predicted mules ────────────────────────────────────────
+predicted_mule_ids = (
+    test_accounts
+    .filter(pl.col("pred") > threshold)["account_id"]
+    .to_list()
+)
+print(f"Predicted mules (threshold {threshold:.4f}): {len(predicted_mule_ids)}")
+
+# ── Compute daily transaction volumes for predicted mules ────────────
+print("\nScanning transactions for temporal windows...")
+windows = {}
+daily_parts = []
+
+if predicted_mule_ids:
+    target_mule_ids = pl.Series("account_id", predicted_mule_ids).implode()
+    for batch in ["batch-1", "batch-2", "batch-3", "batch-4"]:
+        print(f"  Scanning {batch}...")
+        df = (
+            pl.scan_parquet(DATA / "transactions" / batch / "*.parquet")
+            .filter(pl.col("account_id").is_in(target_mule_ids))
+            .with_columns(pl.col("transaction_timestamp").str.to_datetime().alias("ts"))
+            .with_columns(pl.col("ts").dt.date().alias("d"))
+            .group_by(["account_id", "d"])
+            .agg([
+                pl.col("amount").abs().sum().alias("daily_vol"),
+                pl.len().alias("daily_txns"),
+            ])
+            .collect()
+        )
+        daily_parts.append(df)
+
+if daily_parts:
+    daily = (
+        pl.concat(daily_parts)
+        .group_by(["account_id", "d"])
+        .agg([
+            pl.col("daily_vol").sum(),
+            pl.col("daily_txns").sum(),
+        ])
+    )
+
+    print(f"\nBuilding dynamic windows for {len(predicted_mule_ids)} accounts...")
+    processed = 0
+
+    for acc_id in predicted_mule_ids:
+        acc_df = daily.filter(pl.col("account_id") == acc_id).sort("d")
+        if acc_df.is_empty():
+            continue
+
+        pdf   = acc_df.to_pandas()
+        dates = pd.to_datetime(pdf["d"]).tolist()
+        vols  = pdf["daily_vol"].values.astype(float)
+
+        if len(dates) < 2:
+            windows[acc_id] = (
+                dates[0].strftime("%Y-%m-%d %H:%M:%S"),
+                (dates[0] + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            processed += 1
+            continue
+
+        date_range = pd.date_range(start=min(dates), end=max(dates), freq="D")
+        vol_series = pd.Series(0.0, index=date_range)
+        for dt, value in zip(dates, vols):
+            vol_series[dt] = value
+
+        rolling_avg = vol_series.rolling(window=7, min_periods=1, center=True).mean()
+        peak_idx    = rolling_avg.argmax()
+
+        baseline = vol_series.median()
+        if baseline <= 0:
+            baseline = vol_series.mean()
+        if baseline <= 0:
+            baseline = 1.0
+
+        all_dates    = vol_series.index
+        rolling_vals = rolling_avg.values
+
+        left = peak_idx
+        while left > 0 and rolling_vals[left - 1] >= baseline:
+            left -= 1
+
+        right = peak_idx
+        while right < len(rolling_vals) - 1 and rolling_vals[right + 1] >= baseline:
+            right += 1
+
+        start_date = all_dates[left]
+        end_date   = all_dates[right] + timedelta(days=1)
+
+        windows[acc_id] = (
+            start_date.strftime("%Y-%m-%d %H:%M:%S"),
+            end_date.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        processed += 1
+        if processed % 500 == 0:
+            print(f"  Processed {processed}/{len(predicted_mule_ids)} accounts...")
+
+    print(f"  Processed {processed}/{len(predicted_mule_ids)} accounts total")
+
+# ── Window stats ─────────────────────────────────────────────────────
+if windows:
+    window_days = np.array([
+        (pd.Timestamp(e) - pd.Timestamp(s)).days
+        for s, e in windows.values()
+    ])
+    print(f"\nWindow size stats (days):")
+    print(f"  Mean:   {window_days.mean():.1f}")
+    print(f"  Median: {np.median(window_days):.1f}")
+    print(f"  Min:    {window_days.min()}")
+    print(f"  Max:    {window_days.max()}")
+
+# ── Build submission ─────────────────────────────────────────────────
+sub_df = test_accounts.select(["account_id", "pred"]).rename({"pred": "is_mule"})
+
+suspicious_starts, suspicious_ends = [], []
+for row in sub_df.iter_rows(named=True):
+    acc_id = row["account_id"]
+    if row["is_mule"] > threshold and acc_id in windows:
+        s, e = windows[acc_id]
+        suspicious_starts.append(s)
+        suspicious_ends.append(e)
+    else:
+        suspicious_starts.append("")
+        suspicious_ends.append("")
+
+submission = pd.DataFrame({
+    "account_id":       sub_df["account_id"].to_list(),
+    "is_mule":          sub_df["is_mule"].to_list(),
+    "suspicious_start": suspicious_starts,
+    "suspicious_end":   suspicious_ends,
+})
+
+out_path = ROOT / "submission.csv"
+submission.to_csv(out_path, index=False)
+
+n_with_windows = sum(1 for s in suspicious_starts if s)
+print(f"\n✓ submission.csv saved  {submission.shape}  [{pred_label}]")
+is_mule_arr = submission["is_mule"].values
+print(f"  is_mule stats: mean={is_mule_arr.mean():.4f}  min={is_mule_arr.min():.4f}  max={is_mule_arr.max():.4f}")
+print(f"  Accounts with temporal windows: {n_with_windows}")
+print(f"\n  Sample predicted mules (top 10 by score):")
+top = submission.sort_values("is_mule", ascending=False).head(10)
+print(top[["account_id", "is_mule", "suspicious_start", "suspicious_end"]].to_string(index=False))
