@@ -1,4 +1,4 @@
-# AML Mule Account Detection — Team Vanguard
+# AML Mule Account Detection — Team SHUV
 
 > **Forensic-Grade Machine Learning System for Anti-Money Laundering**  
 > National AML Hackathon 2026 · 400M+ Transactions · AUC-ROC 0.9947
