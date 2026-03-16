@@ -455,4 +455,4 @@ The jump from V8 → V11 was achieved almost entirely by *removing* 18 features,
 
 ---
 
-**Team Vanguard — National AML Hackathon 2026**
+**Team SHUV — National AML Hackathon 2026**
